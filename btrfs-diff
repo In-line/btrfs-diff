@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+#  btrfs-diff
+#  Copyright (c) 2024 Alik Aslanyan <inline0@pm.me>
+#
+#     This program is free software; you can redistribute it and/or modify it
+#     under the terms of the GNU General Public License as published by the
+#     Free Software Foundation; either version 3 of the License, or (at
+#     your option) any later version.
+# 
+#     This program is distributed in the hope that it will be useful, but
+#     WITHOUT ANY WARRANTY; without even the implied warranty of
+#     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+#     General Public License for more details.
+# 
+#     You should have received a copy of the GNU General Public License
+#     along with this program; if not, write to the Free Software Foundation,
+#     Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+import os
+import subprocess
+from collections import defaultdict
+import json
+from typing import NamedTuple
+import argparse
+import sys
+
+
+# Function to gather data into a nested dictionary structure
+def build_tree(folder, folder_totals, tree_structure, enable_human_readable_size):
+    total_diff = folder_totals.get(folder, 0)
+
+    folder_data = {
+        "name": os.path.basename(folder) if folder else "/",
+        "total_size": human_readable_size(total_diff) if enable_human_readable_size else total_diff,
+        "files": {},
+        "subfolders": [],
+    }
+
+    # Sort files by size difference and prepare their output
+    files = sorted(
+        tree_structure.get(folder, {}).items(), key=lambda x: x[1], reverse=True
+    )
+
+    for file, size in files:
+        file_name = os.path.basename(file)
+        folder_data["files"][file_name] = f"{human_readable_size(size)}" if enable_human_readable_size else size
+
+    # Sort subfolders by their total size difference and recurse into them
+    subfolders = sorted(
+        [f for f in folder_totals if os.path.dirname(f) == folder],
+        key=lambda f: abs(folder_totals[f]),
+        reverse=True,
+    )
+
+    for subfolder in subfolders:
+        if subfolder:
+            folder_data["subfolders"].append(
+                build_tree(subfolder, folder_totals, tree_structure, enable_human_readable_size)
+            )
+
+    if len(folder_data["files"]) == 0:
+        del folder_data["files"]
+
+    if len(folder_data["subfolders"]) == 0:
+        del folder_data["subfolders"]
+
+    return folder_data
+
+
+def get_transaction_id(snapshot):
+    """Extract the transaction ID using btrfs subvolume find-new command."""
+    try:
+        output = subprocess.check_output(
+            ["pkexec", "btrfs", "subvolume", "find-new", snapshot, "9999999"], text=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"Failed to find transaction ID for {snapshot}", e)
+
+    trans_id = output.split("transid marker was ")[-1].strip()
+    if not trans_id.isdigit() or int(trans_id) <= 0:
+        raise ValueError(f"Failed to find valid generation for: {snapshot}")
+
+    return trans_id
+
+
+# inode 68699778 file offset 53248 len 4096 disk start 1691742208 offset 0 gen 1315253 flags NONE home/codemonkey/.config/Code/User/globalStorage/state.vscdb
+class BTRFSLogEntry(NamedTuple):
+    len: int
+    offset: int
+    path: str
+
+
+def recently_modified_files_log(snapshot, transid):
+    """Find new files in a snapshot."""
+    try:
+        output = subprocess.check_output(
+            ["pkexec", "btrfs", "subvolume", "find-new", snapshot, transid], text=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"Error finding new files for {snapshot}: {e}")
+
+    return [
+        BTRFSLogEntry(
+            len=int(log.split()[6]), offset=int(log.split()[4]), path=log.split()[16]
+        )
+        for log in output.strip().splitlines()[:-1]
+    ]
+
+
+# Function to convert bytes to human-readable format
+def human_readable_size(size):
+    if size is None:
+        return "N/A"
+    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+        if abs(size) < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compare two Btrfs snapshots and find recently modified files, output in JSON."
+    )
+    parser.add_argument("snapshot_old", help="Path to the older snapshot")
+    parser.add_argument("snapshot_new", help="Path to the newer snapshot")
+    parser.add_argument("-o", "--output", help="Output file path (default: stdout)")
+    parser.add_argument("-i", "--indent", type=int, default=4, help="JSON indentation level")
+    parser.add_argument("--human", "--human-readable-sizes", action='store_true', default=False, help="Enable human-readable sizes in output")
+
+    args = parser.parse_args()
+
+    # Check if directories exist
+    if not os.path.isdir(args.snapshot_old):
+        raise ValueError(f"{args.snapshot_old} does not exist")
+    if not os.path.isdir(args.snapshot_new):
+        raise ValueError(f"{args.snapshot_new} does not exist")
+
+    # Extract the transaction ID
+    old_transid = get_transaction_id(args.snapshot_old)
+
+    # Find new files in the newer snapshot
+    logs = recently_modified_files_log(args.snapshot_new, old_transid)
+
+    # Data structure to store file differences and folder totals
+    folder_totals = defaultdict(int)
+
+    # Store files in a hierarchical tree-like structure
+    tree_structure = defaultdict(lambda: defaultdict(int))
+
+    # Calculate size differences and store the information
+    for log in logs:
+        # Update folder totals
+        folder = os.path.dirname(log.path)
+        while True:
+            folder_totals[folder] += log.len
+            if not folder:
+                break
+            folder = os.path.dirname(folder)
+
+        # Add file to tree structure
+        tree_structure[os.path.dirname(log.path)][log.path] += log.len
+
+    output = build_tree("", folder_totals, tree_structure, args.human)
+
+    # Print the output as valid JSON
+    print(
+        json.dumps(output, indent=args.indent),
+        file=open(args.output, "w") if args.output else sys.stdout,
+    )
+
+
+if __name__ == "__main__":
+    main()
